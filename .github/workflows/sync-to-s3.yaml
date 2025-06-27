@@ -1,0 +1,87 @@
+name: Sync Changed Files to S3
+
+on:
+  workflow_call:
+    inputs:
+      bucket:
+        required: true
+        type: string
+      region:
+        required: true
+        type: string
+      secret_id:
+        required: true
+        type: string
+      role_to_assume:
+        required: true
+        type: string
+
+jobs:
+  sync-and-invalidate:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Fetch all branches
+        run: git fetch --all
+
+      - name: Configure AWS credentials using OIDC
+        uses: aws-actions/configure-aws-credentials@b47578312673ae6fa5b5096b330d9fbac3d116df # v4.2.1
+        with:
+          role-to-assume: ${{ inputs.role_to_assume }}
+          aws-region: ${{ inputs.region }}
+
+      - name: Get list of changed files
+        id: changed-files
+        run: |
+          git fetch origin main --depth=2
+          BASE=$(git rev-parse HEAD^)
+          git diff --name-only "$BASE" HEAD > changed_files.txt
+          cat changed_files.txt
+
+      - name: Sync changed files to S3
+        id: upload
+        run: |
+          if [ ! -s changed_files.txt ]; then
+            echo "No changed files to upload."
+            echo "uploaded=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          grep -v '^\.github/' changed_files.txt > filtered_files.txt || true
+
+          uploaded=false
+          while read file; do
+            if [ -f "$file" ]; then
+              aws s3 cp "$file" "s3://${{ inputs.bucket }}/$file" --region ${{ inputs.region }} || true
+              uploaded=true
+            fi
+          done < filtered_files.txt
+
+          echo "uploaded=$uploaded" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch CloudFront Distribution ID from AWS Secrets Manager
+        id: fetch-dist-id
+        run: |
+          SECRET=$(aws secretsmanager get-secret-value \
+            --secret-id ${{ inputs.secret_id }} \
+            --region ${{ inputs.region }} \
+            --query SecretString \
+            --output text)
+
+          DIST_ID=$(echo "$SECRET" | jq -r .distribution_id)
+          echo "distribution_id=$DIST_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Invalidate CloudFront cache
+        if: steps.upload.outputs.uploaded == 'true'
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id ${{ steps.fetch-dist-id.outputs.distribution_id }} \
+            --paths "/index.html" "/"
+            
